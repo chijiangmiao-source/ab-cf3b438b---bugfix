@@ -187,6 +187,29 @@ def fixed_cases():
         check("用例10 序列 [0,2] 与 [1,0]", (a, b) == ((0, 2), (1, 0)),
               repr((a, b)))
 
+    # 11) 字母表序裁决回归：alphabet ["b","a"] 规定 b<a。等长（5）的
+    #     歧义串有 abbab 与 bbbab，按完整编码串必须选字母表序更小的
+    #     bbbab，分解为 [0,1]=bbba+b 与 [1,1,1,3]=b+b+b+ab。
+    words11 = ["bbba", "b", "abba", "ab"]
+    ok11, p11 = run_engine(["b", "a"], words11)
+    codec11 = Codec(["b", "a"])
+    check("用例11 判定歧义", not ok11)
+    if not ok11:
+        (key11, (a11, b11)) = p11
+        check("用例11 等长裁决选 bbbab（非 abbab）",
+              key11[1] == codec11.encode("bbbab"), repr(key11))
+        check("用例11 长度为5", key11[0] == 5, str(key11))
+        check("用例11 序列 [0,1] 与 [1,1,1,3]",
+              (a11, b11) == ((0, 1), (1, 1, 1, 3)), repr((a11, b11)))
+        check("用例11 bbbab < abbab（b<a）",
+              codec11.encode("bbbab") < codec11.encode("abbab"))
+        check("用例11 两组序列均拼出 bbbab",
+              b"".join(codec11.encode(words11[i]) for i in a11) == key11[1]
+              and b"".join(codec11.encode(words11[i]) for i in b11) == key11[1])
+    amb11, best11, _ = brute_force(words11, ["b", "a"], max_depth=7)
+    check("用例11 与对拍三重裁决一致", not ok11 and amb11 and p11[0] == best11,
+          f"engine={p11[0] if not ok11 else None} brute={best11}")
+
 
 # ---------------------------------------------------------------------------
 # 非法输入 422
@@ -326,6 +349,29 @@ def http_mode(base: str):
               f"{amb['joined_a']} vs {amb['joined_b']}")
         check("HTTP 序列不同", amb["sequences_differ"] is True)
         check("HTTP 含逐步推导", len(amb["derivation"]) >= 2)
+
+    status, body = http_request(base, "POST", "/verify",
+                                {"alphabet": ["b", "a"],
+                                 "codewords": ["bbba", "b", "abba", "ab"]})
+    check("HTTP 标题用例 200 且 unique=false",
+          status == 200 and body.get("unique") is False, str(body)[:200])
+    if status == 200 and body.get("ambiguity"):
+        amb = body["ambiguity"]
+        words = ["bbba", "b", "abba", "ab"]
+        join = lambda seq: "".join(words[i] for i in seq)
+        check("HTTP 等长裁决串为 bbbab/长度5",
+              amb["encoded_string"] == "bbbab" and amb["length"] == 5,
+              amb.get("encoded_string"))
+        check("HTTP 规范索引 [0,1] 与 [1,1,1,3]",
+              amb["indices_a"] == [0, 1] and amb["indices_b"] == [1, 1, 1, 3],
+              f'{amb.get("indices_a")} {amb.get("indices_b")}')
+        check("HTTP 两组索引重新拼出 bbbab",
+              join(amb["indices_a"]) == join(amb["indices_b"]) == "bbbab"
+              == amb["encoded_string"],
+              f'{amb.get("joined_a")} {amb.get("joined_b")}')
+        check("HTTP 推导到达空残串",
+              amb["derivation"][-1]["residual_after"] == ""
+              and amb["derivation"][-1]["epsilon_after"] is True)
 
     status, body = http_request(base, "POST", "/verify",
                                 {"alphabet": ["0", "1"], "codewords": ["00", "01", "10", "11"]})

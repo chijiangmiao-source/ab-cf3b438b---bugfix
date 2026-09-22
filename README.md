@@ -55,6 +55,23 @@ docker compose --profile acceptance run --rm verify
 退出码 0 表示全部通过。对拍器独立枚举所有短索引序列并按同一三重规则
 裁决，与残串图结果逐项比对。
 
+## 自动化测试（pytest）
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests/
+```
+
+`tests/test_algorithm.py` 为代码级算法测试：等长候选字母表序裁决
+（含标题回归用例 `alphabet=["b","a"]` → `bbbab`）、多条等长路径汇入
+同一残串状态、自定义字母表序与 ASCII 序不同、更短歧义串优先、第三级
+索引裁决，以及唯一可译码三种终止原因（`empty_set` / `repeated_set` /
+`closure_exhausted`）的逐轮残串证明；另含 40 组乱序字母表随机码与
+独立暴力枚举器对拍。`tests/test_http_api.py` 由 `conftest.py` 启动真实
+uvicorn 子进程做 API/HTTP 冒烟：标题请求返回 200/`unique=false`/`bbbab`
+与两组规范索引、拼接与逐步残串推导的完整复核，外加 `/health` 与结构化
+422 行为。
+
 ## 接口
 
 ### `POST /verify`

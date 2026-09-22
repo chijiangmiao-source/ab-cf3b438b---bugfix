@@ -27,11 +27,12 @@ r' = ε 时两侧恰好对齐，两条路径拼出同一编码串，码不唯一
     c_k = r + r'（r' 非空）：翻转，新短侧串 X，新长侧串 X + r'；
     r = c_k + r'：不翻转，新短侧串 Y + c_k，长侧串 X 不变；
     c_k = r：到达 ε，公共串即 X，长度 z。
-所有边权严格为正且 z 单调不减，故按 (z, X) 宽度优先，第一个最优
+每条转移在 (z, X) 序下键值非递减（残串吃码字时 (z, X) 完全不变，
+翻转时 z 严格增大），故 Dijkstra 必须真正按 (z, X) 排序，第一个
 ε 即「串长最短、字母表序最小」者；再比较规范化（取两组序列逐元素
 字典序较小者在前）后的索引序列完成第三重裁决。同一中间状态保留
-(z, X) 最小的一个标签即可：若另一标签 (z', X') 不小于它，沿同样的
-后续转移始终不小于；若二者完全相同，则短侧串 X' 已有两种分节，
+(z, Y) 最小的一个标签即可：若另一标签 (z', Y') 不小于它，沿任意相同
+后续转移键序始终不小于；若二者完全相同，则短侧串 Y 已有两种分节，
 本身构成更短（长度 d < z）的歧义见证，不会影响最优解。
 
 实现中码字统一用「字母表秩字节」表示：第 k 个有序字母表符号编码
@@ -365,11 +366,16 @@ def residual_rounds(
 #   表示当前第 L 侧为长侧，短侧已拼串 Y（长度 d），长侧串 X = Y + r
 #   （长度 z = d+|r|）。初始 c_i = c_j + r：0 侧长、1 侧短，Y = c_j。
 #   短侧补码字 c_k：
-#     c_k = r + r'（r' 非空）：翻转，新短侧串 X；
-#     r = c_k + r'：不翻转，新短侧串 Y + c_k；
+#     c_k = r + r'（r' 非空）：翻转，新短侧串 X，新键
+#       (z + |r'|, X + r')，z 严格增大；
+#     r = c_k + r'：不翻转，新短侧串 Y + c_k，长侧串 X 不变，
+#       新键仍为 (z, X)（零权边）；
 #     c_k = r：到达 ε，公共串为 X。
-#   堆键取 (z, X)，第一个弹出的 ε 即「长度最短、字母表序最小」的
-#   歧义串 w（与沿哪条路径到达无关，故每状态只保留最优 (d, Y)）。
+#   堆键严格取 (z, X)，其中 X = Y + r 是当前长侧完整串；秩字节序即
+#   字母表序。第一个弹出的 ε 即「长度最短、字母表序最小」的歧义串 w
+#   （与沿哪条路径到达无关，故每状态只保留字典序最小的最优标签 Y；
+#   零权边意味着不能只按长度判重——长度相同但 X 字母表序更小的标签
+#   必须能覆盖先前较大的标签）。
 #
 # 步骤 B（DAG 分解 + 规范化序列裁决）：在 w 的位置 DAG 上动态规划，
 #   边 p→p+|c_k| 当且仅当 c_k = w[p:p+|c_k|]。求从 0 到 |w| 的字典序
@@ -402,24 +408,29 @@ def _shortest_ambiguous_string(
             gen[r] = got
         return got
 
-    # 每状态保留当前最优 (d, Y)；步骤 A 只决定串文本，与路径序列无关。
-    best_length: dict[_State, int] = {}
+    # 每状态保留当前最优标签 (z, Y)；标签序即堆键去掉 ε 信息后的
+    # (z, X=Y+r) 字典序。注意零权边（r = c_k + r'）保持 (z, X) 不变，
+    # 因此同长度但 X 字母表序更小的新标签必须覆盖旧标签，不能只按长度判重。
+    best: dict[_State, tuple[int, bytes]] = {}
     heap: list[tuple[int, bytes, int, int, bytes]] = []
     serial = 0
 
     def consider(state: _State, d: int, y_text: bytes) -> None:
         nonlocal serial
-        encoded_length = d + len(state.residual)
-        old_length = best_length.get(state)
-        if old_length is not None and old_length <= encoded_length:
+        r = state.residual
+        z = d + len(r)
+        x_text = y_text + r
+        label = (z, x_text)
+        old = best.get(state)
+        if old is not None and old <= label:
             return
-        best_length[state] = encoded_length
+        best[state] = label
         serial += 1
         heapq.heappush(
             heap,
             (
-                encoded_length,
-                state.residual,
+                z,
+                x_text,
                 state.long_side,
                 serial,
                 y_text,
@@ -441,14 +452,14 @@ def _shortest_ambiguous_string(
     visited = 0
     edges_seen = 0
     while heap:
-        z, residual, long_side, _, y_text = heapq.heappop(heap)
-        state = _State(residual, long_side)
-        if best_length.get(state) != z:
+        z, x_text, long_side, _, y_text = heapq.heappop(heap)
+        # 残串由长、短两侧串之差恢复：r = X − Y。
+        r = x_text[len(y_text):]
+        state = _State(r, long_side)
+        if best.get(state) != (z, x_text):
             continue  # 过期堆项
         visited += 1
-        r = state.residual
         d = z - len(r)
-        x_text = y_text + r
         short_side = 1 - long_side
 
         for edge in edges_of(r):
