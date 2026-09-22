@@ -105,6 +105,222 @@ def run_engine(alphabet: list[str], words: list[str]):
 
 
 # ---------------------------------------------------------------------------
+# 机械复核：歧义见证推导 与 逐轮残串集合证明
+# ---------------------------------------------------------------------------
+
+
+def engine_step_dicts(codec: Codec, steps) -> list[dict]:
+    """把引擎 DerivationStep 转成与 HTTP 响应同构的解码后字典。"""
+    out = []
+    for s in steps:
+        d = {
+            "kind": s.kind,
+            "append_side": s.append_side,
+            "codeword_index": s.codeword_index,
+            "residual_before": codec.decode(s.residual_before),
+            "residual_after": codec.decode(s.residual_after),
+        }
+        if s.kind == "initial_prefix_pair":
+            d["longer_codeword_index"] = s.longer_codeword_index
+            d["shorter_codeword_index"] = s.shorter_codeword_index
+        out.append(d)
+    return out
+
+
+def replay_witness(words, w_text, indices_a, indices_b, steps) -> str | None:
+    """机械复核歧义见证：返回 None 表示通过，否则返回失败原因。
+
+    只使用原始码字与响应内容：两组索引各自拼出 w；推导从空残串出发，
+    每步在 append_side 侧追加码字，步前/步后残串必须等于两侧已拼串
+    之差，且每步等式可由码字拼接直接验证；按侧收集的码字索引必须
+    复原 indices_a / indices_b；最终残串为 ε、两侧串相等。
+    steps 为解码后的推导步字典（引擎经 engine_step_dicts、HTTP 原生）。
+    """
+    ja = "".join(words[i] for i in indices_a)
+    jb = "".join(words[i] for i in indices_b)
+    if ja != w_text or jb != w_text:
+        return f"拼接不等: joined_a={ja!r} joined_b={jb!r} w={w_text!r}"
+    if list(indices_a) == list(indices_b):
+        return "两组索引序列相同，不构成歧义"
+    if not steps:
+        return "推导步为空"
+
+    def side_diff(sides):
+        a, b = sides
+        if a.startswith(b):
+            return a[len(b):]
+        if b.startswith(a):
+            return b[len(a):]
+        return None
+
+    sides = ["", ""]
+    collected = [[], []]
+    for t, st in enumerate(steps):
+        cur = side_diff(sides)
+        if cur is None:
+            return f"第{t}步前两侧串失去前缀关系: {sides!r}"
+        if cur != st["residual_before"]:
+            return (f"第{t}步 residual_before 不符: 由拼接得 {cur!r}，"
+                    f"响应为 {st['residual_before']!r}")
+        side = st["append_side"]
+        if side not in (0, 1):
+            return f"第{t}步 append_side 非法: {side!r}"
+        k = st["codeword_index"]
+        if not (0 <= k < len(words)):
+            return f"第{t}步码字索引越界: {k}"
+        collected[side].append(k)
+        if st["kind"] == "initial_prefix_pair":
+            long_idx = st["longer_codeword_index"]
+            if st["shorter_codeword_index"] != k:
+                return f"第{t}步 shorter 索引与 codeword_index 不一致"
+            if not (0 <= long_idx < len(words)):
+                return f"第{t}步 longer 索引越界: {long_idx}"
+            if len(words[long_idx]) <= len(words[k]):
+                return f"第{t}步 longer 码字不长于 shorter"
+            if words[long_idx] != words[k] + st["residual_after"]:
+                return f"第{t}步初始等式 c_long = c_short + residual 不成立"
+            collected[1 - side].append(long_idx)
+            sides[1 - side] += words[long_idx]
+        sides[side] += words[k]
+        cur = side_diff(sides)
+        if cur is None:
+            return f"第{t}步后两侧串失去前缀关系: {sides!r}"
+        if cur != st["residual_after"]:
+            return (f"第{t}步 residual_after 不符: 由拼接得 {cur!r}，"
+                    f"响应为 {st['residual_after']!r}")
+        r_before, r_after, ck = st["residual_before"], st["residual_after"], words[k]
+        if st["kind"] == "code_extends_residual":
+            if ck != r_before + r_after:
+                return f"第{t}步等式 c_k = residual + new_residual 不成立"
+        elif st["kind"] == "residual_extends_code":
+            if r_before != ck + r_after or not r_after:
+                return f"第{t}步等式 residual = c_k + new_residual 不成立"
+        elif st["kind"] != "initial_prefix_pair":
+            return f"第{t}步未知 kind: {st['kind']!r}"
+    if steps[-1]["residual_after"] != "":
+        return "推导未到达空残串 ε"
+    if collected[0] != list(indices_a) or collected[1] != list(indices_b):
+        return (f"按侧收集的索引 {collected[0]}/{collected[1]} 与响应 "
+                f"{list(indices_a)}/{list(indices_b)} 不符")
+    if sides[0] != sides[1] or sides[0] != w_text:
+        return f"两侧最终串 {sides!r} 不等或不等于见证串 {w_text!r}"
+    return None
+
+
+def replay_rounds(enc_words, result) -> str | None:
+    """机械复核逐轮残串集合证明（唯一与歧义均适用）：返回 None 通过。
+
+    每条转移等式由码字拼接直接验证；本轮集合必须等于上一轮全部残串
+    的转移结果（ε 除外）之并；复用残串的转移须已在所指轮次列出；
+    new_residuals 须恰为历史未见的残串；终止原因与末轮形态一致。
+    enc_words 为秩字节码字列表，result 为 analyze 的 GraphResult。
+    """
+    edge_map: dict[bytes, list[bytes]] = {}
+    history: list[set[bytes]] = []
+    prev: set[bytes] | None = None
+    for rnd in result.rounds:
+        res_set = set(rnd.residuals)
+        if b"" in res_set:
+            return f"第{rnd.index}轮集合含空残串"
+        if len(res_set) != len(rnd.residuals):
+            return f"第{rnd.index}轮集合存在重复残串"
+        if rnd.index == 1:
+            outs = []
+            for t in rnd.transitions:
+                if t.kind != "initial_prefix_pair":
+                    return "第1轮含非初始码字对转移"
+                li, si = t.longer_index, t.shorter_index
+                if not (0 <= li < len(enc_words)) or not (0 <= si < len(enc_words)):
+                    return "第1轮初始对索引越界"
+                if enc_words[li] != enc_words[si] + t.result or not t.result:
+                    return f"第1轮初始等式不成立: c_{li} = c_{si} + residual"
+                outs.append(t.result)
+            if set(outs) != res_set:
+                return "第1轮集合与初始对结果之并不符"
+            if rnd.epsilon:
+                return "第1轮不可能产生 ε"
+        else:
+            if prev is None:
+                return "轮次缺少第1轮"
+            expanded, reused = set(rnd.expanded), set(rnd.reuse.keys())
+            if expanded & reused:
+                return f"第{rnd.index}轮 expanded 与 reuse 重叠"
+            if expanded | reused != prev:
+                return f"第{rnd.index}轮 展开集∪复用集 != 上一轮集合"
+            for t in rnd.transitions:
+                if t.kind == "initial_prefix_pair":
+                    return f"第{rnd.index}轮不应再出现初始码字对"
+                r = t.residual
+                if r not in expanded:
+                    return f"第{rnd.index}轮转移的残串不在本轮展开集中"
+                k = t.code_index
+                if not (0 <= k < len(enc_words)):
+                    return f"第{rnd.index}轮码字索引越界: {k}"
+                if t.kind == "code_extends_residual":
+                    if enc_words[k] != r + t.result:
+                        return f"第{rnd.index}轮等式 c_{k} = residual + new 不成立"
+                elif t.kind == "residual_extends_code":
+                    if r != enc_words[k] + t.result or not t.result:
+                        return f"第{rnd.index}轮等式 residual = c_{k} + new 不成立"
+                else:
+                    return f"第{rnd.index}轮未知转移类型 {t.kind!r}"
+                edge_map.setdefault(r, []).append(t.result)
+            # 被展开但无任何前缀匹配的残串同样视为已展开（贡献空结果集）。
+            for r in expanded:
+                edge_map.setdefault(r, [])
+            for r, first_round in rnd.reuse.items():
+                if not (1 <= first_round < rnd.index):
+                    return f"第{rnd.index}轮复用轮次 {first_round} 非法"
+                if r not in edge_map:
+                    return f"第{rnd.index}轮复用残串从未展开过"
+                if r not in set(result.rounds[first_round - 1].expanded):
+                    return f"复用残串并非在第 {first_round} 轮首次展开"
+            outs = []
+            for r in prev:
+                if r not in edge_map:
+                    return f"第{rnd.index}轮：上一轮残串缺少转移记录"
+                outs.extend(edge_map[r])
+            if (b"" in outs) != rnd.epsilon:
+                return f"第{rnd.index}轮 epsilon 标记与转移结果不符"
+            if set(o for o in outs if o) != res_set:
+                return f"第{rnd.index}轮集合与上一轮转移闭包不符"
+        prior: set[bytes] = set().union(*history) if history else set()
+        if set(rnd.new_residuals) != {r for r in res_set if r not in prior}:
+            return f"第{rnd.index}轮 new_residuals 与历史比对不符"
+        history.append(res_set)
+        prev = res_set
+
+    last = result.rounds[-1]
+    reason = result.termination_reason
+    if reason == "epsilon":
+        if not last.epsilon:
+            return "终止原因为 epsilon 但末轮未产生 ε"
+        if result.unique or result.witness is None:
+            return "产生 ε 却未判定歧义"
+    elif reason == "empty_set":
+        if last.residuals:
+            return "终止原因为 empty_set 但末轮集合非空"
+        if not result.unique:
+            return "empty_set 却未判定唯一"
+    elif reason == "repeated_set":
+        k = last.repeated_of
+        if k is None or not (1 <= k < last.index):
+            return "repeated_set 的 repeated_of_round 非法"
+        if set(last.residuals) != set(result.rounds[k - 1].residuals):
+            return f"末轮集合与第 {k} 轮并不相同"
+        if not result.unique:
+            return "repeated_set 却未判定唯一"
+    elif reason == "closure_exhausted":
+        if last.new_residuals:
+            return "closure_exhausted 但末轮仍有新残串"
+        if not result.unique:
+            return "closure_exhausted 却未判定唯一"
+    else:
+        return f"未知终止原因 {reason!r}"
+    return None
+
+
+# ---------------------------------------------------------------------------
 # 固定验收用例
 # ---------------------------------------------------------------------------
 
@@ -187,6 +403,112 @@ def fixed_cases():
         check("用例10 序列 [0,2] 与 [1,0]", (a, b) == ((0, 2), (1, 0)),
               repr((a, b)))
 
+    # 11) 报告用例：alphabet ["b","a"]（b<a，与 ASCII 顺序相反），
+    #     codewords ["bbba","b","abba","ab"]。长度 5 的歧义串有
+    #     abbab=[2,1]/[3,1,3] 与 bbbab=[0,1]/[1,1,1,3] 两个候选；
+    #     搜索中残串状态 ("ba", 长侧0) 被两条等长（z=4）路径汇入：
+    #     X=abba（初始对 abba=ab+ba）与 X=bbba（bbba=b+bba，残 ba 再
+    #     经码字 b 缩短）。裁决必须按完整编码串的字母表序保留 b 开头
+    #     的标签，最终选字母表序更小的 bbbab。
+    words11 = ["bbba", "b", "abba", "ab"]
+    codec_ba = Codec(["b", "a"])
+    ok11, p11 = run_engine(["b", "a"], words11)
+    check("用例11 判定歧义", not ok11)
+    if not ok11:
+        (key, (a, b)) = p11
+        check("用例11 等长裁决选 bbbab", key[1] == codec_ba.encode("bbbab"),
+              repr(key))
+        check("用例11 长度为5", key[0] == 5, str(key))
+        check("用例11 序列 [0,1] 与 [1,1,1,3]",
+              (a, b) == ((0, 1), (1, 1, 1, 3)), repr((a, b)))
+    res11 = analyze([codec_ba.encode(w) for w in words11])
+    err = replay_witness(words11, "bbbab", res11.witness.indices_a,
+                         res11.witness.indices_b,
+                         engine_step_dicts(codec_ba, res11.witness.derivation))
+    check("用例11 见证推导机械复核（到达空残串）", err is None, err or "")
+    err = replay_rounds([codec_ba.encode(w) for w in words11], res11)
+    check("用例11 逐轮残串集合复核", err is None, err or "")
+
+    # 12) 同一组码字、字母表改为 ASCII 序 ["a","b"]：等长候选的字母表
+    #     序裁决必须跟随自定义顺序翻转，此时应选 abbab——证明裁决依据
+    #     的是接口声明的字母表顺序而非 ASCII 顺序。
+    codec_ab = Codec(["a", "b"])
+    ok12, p12 = run_engine(["a", "b"], words11)
+    check("用例12 判定歧义", not ok12)
+    if not ok12:
+        (key, (a, b)) = p12
+        check("用例12 自定义字母表序翻转裁决 abbab",
+              key[1] == codec_ab.encode("abbab"), repr(key))
+        check("用例12 序列 [2,1] 与 [3,1,3]",
+              (a, b) == ((2, 1), (3, 1, 3)), repr((a, b)))
+
+    # 13) 更短歧义串恒优先于字母表序：追加码字 "a" 后出现长度 2 的
+    #     "ab"=[3]/[4,1]，必须击败长度 5 的 bbbab。
+    words13 = words11 + ["a"]
+    ok13, p13 = run_engine(["b", "a"], words13)
+    check("用例13 判定歧义", not ok13)
+    if not ok13:
+        (key, (a, b)) = p13
+        check("用例13 更短串 ab 优先", key[0] == 2
+              and key[1] == codec_ba.encode("ab"), repr(key))
+        check("用例13 序列 [3] 与 [4,1]", (a, b) == ((3,), (4, 1)),
+              repr((a, b)))
+
+    # 14) 唯一可译·残串集合首次与历史轮次重复：{0,01,11}，S1=S2={1}
+    words14 = ["0", "01", "11"]
+    ok14, _ = run_engine(["0", "1"], words14)
+    check("用例14 {0,01,11} 唯一", ok14)
+    res14 = analyze([codec01.encode(w) for w in words14])
+    check("用例14 终止原因 repeated_set",
+          res14.termination_reason == "repeated_set", res14.termination_reason)
+    err = replay_rounds([codec01.encode(w) for w in words14], res14)
+    check("用例14 逐轮残串证明机械复核", err is None, err or "")
+
+    # 15) 唯一可译·闭包穷尽（不再有新残串）：{00,10,101}
+    words15 = ["00", "10", "101"]
+    ok15, _ = run_engine(["0", "1"], words15)
+    check("用例15 {00,10,101} 唯一", ok15)
+    res15 = analyze([codec01.encode(w) for w in words15])
+    check("用例15 终止原因 closure_exhausted",
+          res15.termination_reason == "closure_exhausted", res15.termination_reason)
+    err = replay_rounds([codec01.encode(w) for w in words15], res15)
+    check("用例15 逐轮残串证明机械复核", err is None, err or "")
+
+    # 16) 结构复核套件：对全部代表用例机械重放逐轮残串证明，歧义用例
+    #     另复核见证推导（索引复原、逐步残串等式、到达空残串）。
+    replay_suite = [
+        (["0", "1"], ["0", "01", "10"]),
+        (["0", "1"], ["0", "1"]),
+        (["0", "1"], ["00", "01", "10", "11"]),
+        (["0", "1"], ["0", "10", "110", "111"]),
+        (["0", "1"], ["0", "01"]),
+        (["0", "1"], ["0", "01", "1"]),
+        (["b", "a"], ["b", "ba", "a"]),
+        (["a", "b"], ["ab", "abb", "ba", "bba"]),
+        (["0", "1"], ["01", "10", "0", "101"]),
+        (["0", "1"], ["0", "01", "10", "010"]),
+        (["b", "a"], ["bbba", "b", "abba", "ab"]),
+        (["a", "b"], ["bbba", "b", "abba", "ab"]),
+        (["b", "a"], ["bbba", "b", "abba", "ab", "a"]),
+        (["0", "1"], ["0", "01", "11"]),
+        (["0", "1"], ["00", "10", "101"]),
+    ]
+    replay_fail = None
+    for alpha, ws in replay_suite:
+        codec = Codec(alpha)
+        enc = [codec.encode(w) for w in ws]
+        res = analyze(enc)
+        err = replay_rounds(enc, res)
+        if err is None and res.witness is not None:
+            wit = res.witness
+            err = replay_witness(ws, codec.decode(wit.encoded), wit.indices_a,
+                                 wit.indices_b,
+                                 engine_step_dicts(codec, wit.derivation))
+        if err is not None:
+            replay_fail = f"{alpha} {ws}: {err}"
+            break
+    check("用例16 全部结构复核通过", replay_fail is None, replay_fail or "")
+
 
 # ---------------------------------------------------------------------------
 # 非法输入 422
@@ -247,6 +569,10 @@ def invalid_cases():
 def fuzz_case(rng: random.Random) -> bool:
     m = rng.randint(2, 4)
     alpha = list(string.digits[:m])
+    # 随机打乱字母表顺序：字母表序通常不同于 ASCII 序，等长候选的
+    # 字母表序裁决（含多条等长路径汇入同一残串状态的情形）随之被
+    # 持续对拍覆盖。
+    rng.shuffle(alpha)
     n = rng.randint(2, 6)
     words: list[str] = []
     while len(words) < n:
@@ -331,6 +657,62 @@ def http_mode(base: str):
                                 {"alphabet": ["0", "1"], "codewords": ["00", "01", "10", "11"]})
     check("唯一用例 200", status == 200 and body.get("unique") is True)
     check("唯一用例残串轮存在", isinstance(body.get("rounds"), list) and body["rounds"])
+
+    # 报告用例（HTTP 冒烟）：字母表 ["b","a"] 与 ASCII 序相反，等长候选
+    # 须按完整编码串的字母表序裁决出 bbbab，全部字段互相一致。
+    reported = {"alphabet": ["b", "a"], "codewords": ["bbba", "b", "abba", "ab"]}
+    status, body = http_request(base, "POST", "/verify", reported)
+    check("报告用例 HTTP 200", status == 200, str(status)[:100])
+    if status == 200:
+        check("报告用例 unique=false", body.get("unique") is False)
+        amb = body.get("ambiguity") or {}
+        check("报告用例 encoded_string=bbbab 且长度5",
+              amb.get("encoded_string") == "bbbab" and amb.get("length") == 5,
+              str(amb.get("encoded_string")))
+        check("报告用例 规范索引 [0,1] / [1,1,1,3]",
+              amb.get("indices_a") == [0, 1] and amb.get("indices_b") == [1, 1, 1, 3],
+              f"{amb.get('indices_a')} / {amb.get('indices_b')}")
+        words = reported["codewords"]
+        ja = "".join(words[i] for i in amb.get("indices_a", []))
+        jb = "".join(words[i] for i in amb.get("indices_b", []))
+        check("报告用例 两组索引各自从原码字拼出 bbbab",
+              ja == jb == "bbbab" == amb.get("joined_a") == amb.get("joined_b"),
+              f"{ja} / {jb}")
+        check("报告用例 拼接明细一致",
+              amb.get("concatenation_a") == ["bbba", "b"]
+              and amb.get("concatenation_b") == ["b", "b", "b", "ab"],
+              str(amb.get("concatenation_b")))
+        steps = amb.get("derivation") or []
+        check("报告用例 推导到达空残串",
+              bool(steps) and steps[-1].get("epsilon_after") is True
+              and steps[-1].get("residual_after") == "")
+        err = replay_witness(words, "bbbab", [0, 1], [1, 1, 1, 3], steps)
+        check("报告用例 逐步推导机械复核", err is None, err or "")
+
+    # 同一组码字、字母表改为 ASCII 序 ["a","b"]：裁决须翻转回 abbab。
+    status, body = http_request(base, "POST", "/verify",
+                                {"alphabet": ["a", "b"],
+                                 "codewords": ["bbba", "b", "abba", "ab"]})
+    check("ASCII序变体 200 且歧义", status == 200 and body.get("unique") is False)
+    if status == 200 and body.get("ambiguity"):
+        amb = body["ambiguity"]
+        check("ASCII序变体 选 abbab",
+              amb.get("encoded_string") == "abbab"
+              and amb.get("indices_a") == [2, 1]
+              and amb.get("indices_b") == [3, 1, 3],
+              str(amb.get("encoded_string")))
+
+    # 更短歧义串恒优先：追加 "a" 后长度 2 的 "ab" 击败长度 5 的候选。
+    status, body = http_request(base, "POST", "/verify",
+                                {"alphabet": ["b", "a"],
+                                 "codewords": ["bbba", "b", "abba", "ab", "a"]})
+    check("更短串优先 200 且歧义", status == 200 and body.get("unique") is False)
+    if status == 200 and body.get("ambiguity"):
+        amb = body["ambiguity"]
+        check("更短串 ab 优先",
+              amb.get("encoded_string") == "ab" and amb.get("length") == 2
+              and amb.get("indices_a") == [3] and amb.get("indices_b") == [4, 1],
+              str(amb.get("encoded_string")))
 
     status, body = http_request(base, "POST", "/verify",
                                 {"alphabet": ["0", "1"], "codewords": [""]})

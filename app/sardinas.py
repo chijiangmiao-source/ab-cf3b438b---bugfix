@@ -369,7 +369,7 @@ def residual_rounds(
 #     r = c_k + r'：不翻转，新短侧串 Y + c_k；
 #     c_k = r：到达 ε，公共串为 X。
 #   堆键取 (z, X)，第一个弹出的 ε 即「长度最短、字母表序最小」的
-#   歧义串 w（与沿哪条路径到达无关，故每状态只保留最优 (d, Y)）。
+#   歧义串 w（与沿哪条路径到达无关，故每状态只保留最优 (z, X) 标签）。
 #
 # 步骤 B（DAG 分解 + 规范化序列裁决）：在 w 的位置 DAG 上动态规划，
 #   边 p→p+|c_k| 当且仅当 c_k = w[p:p+|c_k|]。求从 0 到 |w| 的字典序
@@ -402,26 +402,32 @@ def _shortest_ambiguous_string(
             gen[r] = got
         return got
 
-    # 每状态保留当前最优 (d, Y)；步骤 A 只决定串文本，与路径序列无关。
-    best_length: dict[_State, int] = {}
-    heap: list[tuple[int, bytes, int, int, bytes]] = []
+    # 每状态只保留当前最优标签 (z, X)：z 为长侧串长度、X 为长侧串文本
+    # （X = Y + r，堆键即 (z, X)，与文档所述裁决顺序一致）。同一状态的
+    # 两个标签若 (z,X) 较小，则沿任意相同后续转移拼出的最终串都不大于
+    # 另一标签（长度由 z 决定；等长时 X 是最终串的等长前缀，字典序被
+    # 保持），故较差标签可安全丢弃——包括「等长但 X 更大」的情形。
+    best_label: dict[_State, tuple[int, bytes]] = {}
+    heap: list[tuple[int, bytes, int, bytes, int, bytes]] = []
     serial = 0
 
     def consider(state: _State, d: int, y_text: bytes) -> None:
         nonlocal serial
-        encoded_length = d + len(state.residual)
-        old_length = best_length.get(state)
-        if old_length is not None and old_length <= encoded_length:
+        x_text = y_text + state.residual
+        label = (d + len(state.residual), x_text)
+        old_label = best_label.get(state)
+        if old_label is not None and old_label <= label:
             return
-        best_length[state] = encoded_length
+        best_label[state] = label
         serial += 1
         heapq.heappush(
             heap,
             (
-                encoded_length,
+                label[0],
+                label[1],
+                serial,
                 state.residual,
                 state.long_side,
-                serial,
                 y_text,
             ),
         )
@@ -441,14 +447,13 @@ def _shortest_ambiguous_string(
     visited = 0
     edges_seen = 0
     while heap:
-        z, residual, long_side, _, y_text = heapq.heappop(heap)
+        z, x_text, _, residual, long_side, y_text = heapq.heappop(heap)
         state = _State(residual, long_side)
-        if best_length.get(state) != z:
+        if best_label.get(state) != (z, x_text):
             continue  # 过期堆项
         visited += 1
         r = state.residual
         d = z - len(r)
-        x_text = y_text + r
         short_side = 1 - long_side
 
         for edge in edges_of(r):
