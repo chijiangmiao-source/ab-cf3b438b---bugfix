@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+"""verify —— 可变长码字唯一可译性服务的可执行验收程序。
+
+用法：
+    ./verify                # 直接在进程内对 app 包跑全部验收用例
+    ./verify --url http://127.0.0.1:8000   # 对运行中的服务跑 HTTP 验收
+    ./verify --fuzz N       # 随机对拍 N 个随机码（默认 400）
+
+退出码 0 表示全部通过，非 0 表示存在验收失败。
+
+对拍器（同样自行实现，非任何外部库）：枚举长度不超过 K 的全部索引
+序列并按编码串分组，出现两组不同序列即歧义，最短串再按题目三重
+规则裁决，与残串状态图结果逐项比对。
+"""
+
+from __future__ import annotations
+
+import argparse
+import itertools
+import json
+import os
+import random
+import string
+import sys
+import urllib.error
+import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from app.codec import Codec
+from app.sardinas import analyze
+from app.validation import validate_payload
+
+PASS = "PASS"
+FAIL = "FAIL"
+failures: list[str] = []
+checks = 0
+
+
+def check(name: str, cond: bool, detail: str = "") -> None:
+    global checks
+    checks += 1
+    if cond:
+        print(f"  [{PASS}] {name}")
+    else:
+        failures.append(f"{name}: {detail}")
+        print(f"  [{FAIL}] {name} {detail}")
+
+
+# ---------------------------------------------------------------------------
+# 暴力对拍
+# ---------------------------------------------------------------------------
+
+
+def brute_force(words: list[str], alphabet: list[str], max_depth: int = 7):
+    """返回 (是否歧义, 最优键或 None, 串->两组序列)。
+
+    枚举所有长度 1..max_depth 的索引序列；同一编码串收集不同序列。
+    """
+    codec = Codec(alphabet)
+    enc = [codec.encode(w) for w in words]
+    best: tuple[int, bytes, tuple[int, ...]] | None = None
+    best_seqs: tuple[tuple[int, ...], tuple[int, ...]] | None = None
+    n = len(words)
+    table: dict[bytes, list[tuple[int, ...]]] = {}
+    for depth in range(1, max_depth + 1):
+        for seq in itertools.product(range(n), repeat=depth):
+            s = b"".join(enc[i] for i in seq)
+            table.setdefault(s, []).append(seq)
+    for s, seqs in table.items():
+        distinct: list[tuple[int, ...]] = []
+        for seq in seqs:
+            if seq not in distinct:
+                distinct.append(seq)
+        if len(distinct) < 2:
+            continue
+        # 同一串的所有分解两两组合，规范化后取全局最小序列对，
+        # 与引擎的第三重裁决口径一致。
+        pair_key: tuple[tuple[int, ...], tuple[int, ...]] | None = None
+        for x in range(len(distinct)):
+            for y in range(x + 1, len(distinct)):
+                a, b = distinct[x], distinct[y]
+                na, nb = (a, b) if a <= b else (b, a)
+                cand = (na, nb)
+                if pair_key is None or cand < pair_key:
+                    pair_key = cand
+        assert pair_key is not None
+        key = (len(s), s, pair_key[0], pair_key[1])
+        if best is None or key < best:
+            best = key
+            best_seqs = pair_key
+    return best is not None, best, best_seqs
+
+
+def run_engine(alphabet: list[str], words: list[str]):
+    codec = Codec(alphabet)
+    result = analyze([codec.encode(w) for w in words])
+    if result.witness is None:
+        return True, None
+    w = result.witness
+    a, b = tuple(w.indices_a), tuple(w.indices_b)
+    na, nb = (a, b) if a <= b else (b, a)
+    key = (len(w.encoded), w.encoded, na, nb)
+    return False, (key, (na, nb))
+
+
+# ---------------------------------------------------------------------------
+# 固定验收用例
+# ---------------------------------------------------------------------------
+
+
+def fixed_cases():
+    print("== 固定用例 ==")
+
+    # 1) 前缀码 0/01/10：01·0 = 0·10 = "010"
+    valid, issues = validate_payload({"alphabet": ["0", "1"], "codewords": ["0", "01", "10"]})
+    check("用例1 输入合法", valid is not None and not issues)
+    codec01 = Codec(["0", "1"])
+    ok, payload = run_engine(["0", "1"], ["0", "01", "10"])
+    check("用例1 判定歧义", not ok, str(payload))
+    if not ok:
+        (key, (a, b)) = payload
+        check("用例1 最短串为 010", key[1] == codec01.encode("010"), repr(key))
+        check("用例1 序列 [0,2] 与 [1,0]", (a, b) == ((0, 2), (1, 0)), repr((a, b)))
+        check("用例1 长度为3", key[0] == 3, str(key))
+
+    # 2) 定长二元素 {0,1}：唯一，首轮集合即空
+    ok, _ = run_engine(["0", "1"], ["0", "1"])
+    check("用例2 {0,1} 唯一", ok)
+
+    # 3) 定长 2 bit 码：唯一
+    ok, _ = run_engine(["0", "1"], ["00", "01", "10", "11"])
+    check("用例3 定长2bit 唯一", ok)
+
+    # 4) 前缀无关的即时码：唯一
+    ok, _ = run_engine(["0", "1"], ["0", "10", "110", "111"])
+    check("用例4 前缀码 唯一", ok)
+
+    # 5) {0,01} 反例直觉：它其实唯一可译（残串 1 无码字可接）
+    ok, _ = run_engine(["0", "1"], ["0", "01"])
+    check("用例5 {0,01} 实际唯一", ok)
+
+    # 6) {0,01,1}：01 = 0·1
+    ok, payload = run_engine(["0", "1"], ["0", "01", "1"])
+    check("用例6 判定歧义", not ok)
+    if not ok:
+        (key, (a, b)) = payload
+        check("用例6 最短串 01", key[1] == codec01.encode("01"), repr(key))
+        check("用例6 序列 [0,2] 与 [1]", (a, b) == ((0, 2), (1,)), repr((a, b)))
+
+    # 7) 字母表序自定义：字母表 ["b","a"] 时 "b" < "a"
+    ok, payload = run_engine(["b", "a"], ["b", "ba", "a"])
+    # 与用例6同构：ba = b·a；秩字节下 ba = 0·1
+    check("用例7 自定义字母表序 歧义", not ok)
+    if not ok:
+        (key, (a, b)) = payload
+        codec = Codec(["b", "a"])
+        check("用例7 最短串秩字节 01", key[1] == bytes([0, 1]), repr(key[1]))
+        check("用例7 解码为 ba", codec.decode(key[1]) == "ba")
+
+    # 8) 字母表 3 符号、更长残串链：{a, ab, bba, bb}
+    #    ab = a·b 残 b；残 b 前接码字 bb：bb = b·b 残 b（重复）……
+    #    改取教材经典非唯一码 {ab, abb, ba, bba}：ba·bb? 用对拍验证即可。
+    ok1, _ = run_engine(["a", "b"], ["ab", "abb", "ba", "bba"])
+    check("用例8 经典歧义码 判定歧义", not ok1)
+
+    # 9) 唯一但残串链非空且最终空集：{0, 10, 110, 111} 已覆盖；
+    #    再测 {01, 10, 0, 101} 与对拍一致。
+    words9 = ["01", "10", "0", "101"]
+    ok9, p9 = run_engine(["0", "1"], words9)
+    amb9, best9, _ = brute_force(words9, ["0", "1"], max_depth=7)
+    check("用例9 与对拍一致", ok9 != amb9 or (not ok9 and p9[0] == best9),
+          f"engine={ok9},{p9} brute={amb9},{best9}")
+
+    # 10) 同一最短串存在三种分解：{0,01,10,010} 中 010 =
+    #     [0,2]=0·10, [1,0]=01·0, [3]=010；规范化后最小的两分解
+    #     为 [0,2] 与 [1,0]。
+    words10 = ["0", "01", "10", "010"]
+    ok10, p10 = run_engine(["0", "1"], words10)
+    check("用例10 判定歧义", not ok10)
+    amb10, best10, _ = brute_force(words10, ["0", "1"], max_depth=7)
+    check("用例10 与对拍三重裁决一致", not ok10 and amb10 and p10[0] == best10,
+          f"engine={p10} brute={best10}")
+    if not ok10:
+        (key, (a, b)) = p10
+        check("用例10 最短串 010", key[1] == codec01.encode("010"), repr(key))
+        check("用例10 序列 [0,2] 与 [1,0]", (a, b) == ((0, 2), (1, 0)),
+              repr((a, b)))
+
+
+# ---------------------------------------------------------------------------
+# 非法输入 422
+# ---------------------------------------------------------------------------
+
+
+INVALID_CASES = [
+    ("码字为空串", {"alphabet": ["0", "1"], "codewords": ["0", ""]}, "empty_codeword"),
+    ("码字重复", {"alphabet": ["0", "1"], "codewords": ["0", "0"]}, "duplicate_codeword"),
+    ("码字数仅1", {"alphabet": ["0", "1"], "codewords": ["0"]}, "invalid_size"),
+    ("码字数401", {"alphabet": ["0", "1"], "codewords": ["0"] * 401}, "invalid_size"),
+    ("字母表仅1", {"alphabet": ["0"], "codewords": ["0", "1"]}, "invalid_size"),
+    ("字母表9", {"alphabet": list("012345678"), "codewords": ["0", "1"]}, "invalid_size"),
+    ("字母表重复", {"alphabet": ["0", "0"], "codewords": ["0", "1"]}, "duplicate_symbol"),
+    ("非ASCII符号", {"alphabet": ["0", "é"], "codewords": ["0", "1"]}, "not_ascii"),
+    ("越界字符定位", {"alphabet": ["0", "1"], "codewords": ["0", "1x"]}, "symbol_not_in_alphabet"),
+    ("超长码字257", {"alphabet": ["0"], "codewords_will_build": True}, "codeword_too_long"),
+    ("总长超20000", {"alphabet": ["0"], "total": True}, "total_length_exceeded"),
+    ("缺字段", {"alphabet": ["0", "1"]}, "missing_field"),
+    ("类型错误", {"alphabet": ["0", "1"], "codewords": [0, "1"]}, "not_a_string"),
+]
+
+
+def build_special(name: str):
+    if name == "超长码字257":
+        return {"alphabet": ["0", "1"], "codewords": ["0", "1" * 257]}
+    if name == "总长超20000":
+        # 79 个互异的 256 长码字（零填充二进制）+ 一个 "0"：
+        # 总长 79*256+1 = 20225 > 20000，且各码字互异。
+        big = [bin(i)[2:].zfill(256) for i in range(79)]
+        return {"alphabet": ["0", "1"], "codewords": big + ["0"]}
+    return None
+
+
+def invalid_cases():
+    print("== 非法输入（结构化 422，含位置）==")
+    for name, payload, expected_code in INVALID_CASES:
+        special = build_special(name)
+        data = special if special is not None else payload
+        valid, issues = validate_payload(data)
+        codes = [i.code for i in issues]
+        locs = [tuple(i.loc) for i in issues]
+        check(f"非法[{name}] 被拒", valid is None and expected_code in codes,
+              f"codes={codes}")
+        check(f"非法[{name}] 带位置", any(len(loc) >= 2 for loc in locs), f"locs={locs}")
+        if name == "越界字符定位":
+            issue = next(i for i in issues if i.code == "symbol_not_in_alphabet")
+            check("越界字符位置 codewords[1].char[1]",
+                  tuple(issue.loc) == ("body", "codewords", 1, "char", 1),
+                  repr(issue.loc))
+
+
+# ---------------------------------------------------------------------------
+# 随机模糊对拍
+# ---------------------------------------------------------------------------
+
+
+def fuzz_case(rng: random.Random) -> bool:
+    m = rng.randint(2, 4)
+    alpha = list(string.digits[:m])
+    n = rng.randint(2, 6)
+    words: list[str] = []
+    while len(words) < n:
+        L = rng.randint(1, 3)
+        w = "".join(rng.choice(alpha) for _ in range(L))
+        if w and w not in words:
+            words.append(w)
+
+    ok_engine, engine_payload = run_engine(alpha, words)
+    depth = {2: 11, 3: 9, 4: 8}.get(n, 7)
+    amb_brute, best_brute, brute_seqs = brute_force(words, alpha, max_depth=depth)
+
+    if not ok_engine:
+        # 引擎声称歧义：连接等式必须成立，序列必须不同。
+        (key, (a, b)) = engine_payload
+        codec = Codec(alpha)
+        sa = b"".join(codec.encode(words[i]) for i in a)
+        sb = b"".join(codec.encode(words[i]) for i in b)
+        if sa != sb or a == b:
+            print(f"\n模糊失败(见证不成立): {alpha} {words} {a} {b}")
+            return False
+        if amb_brute and key != best_brute:
+            print(f"\n模糊失败(裁决不一致): {words}\n engine={key}\n brute ={best_brute}")
+            return False
+    else:
+        # 引擎声称唯一：暴力在深度7内不得发现碰撞（若发现则结论错误）。
+        if amb_brute:
+            print(f"\n模糊失败(漏报歧义): {words} brute={best_brute}")
+            return False
+    return True
+
+
+def fuzz(count: int):
+    print(f"== 随机对拍 x{count} ==")
+    rng = random.Random(20260919)
+    failed = 0
+    for i in range(count):
+        if not fuzz_case(rng):
+            failed += 1
+            if failed >= 5:
+                break
+    check(f"随机对拍全部通过", failed == 0, f"{failed} 个失败")
+
+
+# ---------------------------------------------------------------------------
+# HTTP 模式
+# ---------------------------------------------------------------------------
+
+
+def http_request(base: str, method: str, path: str, body=None):
+    data = None
+    headers = {}
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(base.rstrip("/") + path, data=data, headers=headers,
+                                 method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode())
+
+
+def http_mode(base: str):
+    print(f"== HTTP 验收 @ {base} ==")
+    status, body = http_request(base, "GET", "/health")
+    check("GET /health 200", status == 200 and body.get("status") == "ok", str(body))
+
+    status, body = http_request(base, "POST", "/verify",
+                                {"alphabet": ["0", "1"], "codewords": ["0", "01", "10"]})
+    check("歧义用例 200", status == 200 and body.get("unique") is False, str(body)[:200])
+    if status == 200 and body.get("ambiguity"):
+        amb = body["ambiguity"]
+        check("HTTP joined_a == joined_b == 010",
+              amb["joined_a"] == amb["joined_b"] == "010",
+              f"{amb['joined_a']} vs {amb['joined_b']}")
+        check("HTTP 序列不同", amb["sequences_differ"] is True)
+        check("HTTP 含逐步推导", len(amb["derivation"]) >= 2)
+
+    status, body = http_request(base, "POST", "/verify",
+                                {"alphabet": ["0", "1"], "codewords": ["00", "01", "10", "11"]})
+    check("唯一用例 200", status == 200 and body.get("unique") is True)
+    check("唯一用例残串轮存在", isinstance(body.get("rounds"), list) and body["rounds"])
+
+    status, body = http_request(base, "POST", "/verify",
+                                {"alphabet": ["0", "1"], "codewords": [""]})
+    check("非法输入 422", status == 422 and body.get("error", {}).get("issues"))
+    if status == 422:
+        loc = body["error"]["issues"][0]["loc"]
+        check("422 含位置", loc and loc[0] == "body", str(loc))
+
+
+def main():
+    parser = argparse.ArgumentParser(description="验收服务")
+    parser.add_argument("--url", help="运行中服务的 base URL，缺省为进程内直跑")
+    parser.add_argument("--fuzz", type=int, default=400, help="随机对拍数量")
+    args = parser.parse_args()
+
+    if args.url:
+        http_mode(args.url)
+    else:
+        fixed_cases()
+        invalid_cases()
+        fuzz(args.fuzz)
+
+    print(f"\n共 {checks} 项检查，失败 {len(failures)} 项")
+    sys.exit(1 if failures else 0)
+
+
+if __name__ == "__main__":
+    main()
